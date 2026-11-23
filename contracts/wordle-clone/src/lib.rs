@@ -425,6 +425,52 @@ impl WordleClone {
         Ok(())
     }
 
+    /// Reveal the plaintext answer for an open puzzle using a cryptographic salt. Admin only.
+    ///
+    /// Computes `SHA-256(salt || answer)` and verifies against `answer_commitment`.
+    /// Transitions the puzzle to `Revealed` state; prevents dictionary pre-computation attacks (#1672).
+    /// Must be called before `finalize_result`.
+    pub fn reveal_answer_salted(
+        env: Env,
+        puzzle_id: u64,
+        answer: Bytes,
+        salt: BytesN<32>,
+    ) -> Result<(), Error> {
+        let admin = get_admin(&env)?;
+        admin.require_auth();
+
+        if answer.len() != WORD_LENGTH {
+            return Err(Error::InvalidWordLength);
+        }
+
+        let mut puzzle: PuzzleData = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Puzzle(puzzle_id))
+            .ok_or(Error::PuzzleNotFound)?;
+
+        if puzzle.status != PuzzleStatus::Open {
+            return Err(Error::PuzzleAlreadyFinalized);
+        }
+
+        let mut preimage = Bytes::new(&env);
+        preimage.append(&Bytes::from_array(&env, &salt.to_array()));
+        preimage.append(&answer);
+
+        let revealed_hash: BytesN<32> = env.crypto().sha256(&preimage).into();
+        if revealed_hash != puzzle.answer_commitment {
+            return Err(Error::CommitmentMismatch);
+        }
+
+        puzzle.status = PuzzleStatus::Revealed;
+        puzzle.answer = answer;
+        persist_set(&env, DataKey::Puzzle(puzzle_id), &puzzle);
+
+        AnswerRevealed { puzzle_id }.publish(&env);
+
+        Ok(())
+    }
+
     // -----------------------------------------------------------------------
     // finalize_result
     // -----------------------------------------------------------------------
@@ -1210,5 +1256,111 @@ mod test {
         assert_eq!(snapshot.answer.len(), 0);
         assert_eq!(snapshot.guesses.len(), 1);
         assert_eq!(snapshot.guesses.get(0).unwrap().scores.len(), 0);
+    }
+
+    // ------------------------------------------------------------------
+    // Issue #1672: Dictionary attack assessment & salted commitment protocol
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn test_dictionary_attack_recovers_unsalted_commitment() {
+        let env = Env::default();
+        let (client, _, _, _) = setup(&env);
+        env.mock_all_auths();
+
+        // Secret committed answer (unsalted SHA-256)
+        let secret_word = b"CRANE";
+        let commitment = sha256_of(&env, secret_word);
+        client.create_daily_puzzle(&101u64, &commitment);
+
+        // Adversary inspects the public puzzle commitment
+        let puzzle = client.get_puzzle(&101u64).unwrap();
+        assert_eq!(puzzle.status, PuzzleStatus::Open);
+
+        // Small 5-letter candidate dictionary
+        let dictionary: [&[u8; 5]; 5] = [b"APPLE", b"BRAVE", b"CRANE", b"DANCE", b"EAGLE"];
+
+        // Offline pre-computation attack enumerates the dictionary
+        let mut recovered_word: Option<&[u8; 5]> = None;
+        for candidate in dictionary.iter() {
+            let candidate_hash = sha256_of(&env, *candidate);
+            if candidate_hash == puzzle.answer_commitment {
+                recovered_word = Some(*candidate);
+                break;
+            }
+        }
+
+        // Successfully recovered the secret answer before guessing closes
+        assert!(recovered_word.is_some());
+        assert_eq!(recovered_word.unwrap(), secret_word);
+    }
+
+    #[test]
+    fn test_salted_commitment_protocol_defeats_dictionary_enumeration() {
+        let env = Env::default();
+        let (client, _, _, _) = setup(&env);
+        env.mock_all_auths();
+
+        let secret_word = b"CRANE";
+        let salt_bytes: [u8; 32] = [0x5A; 32];
+        let _salt = BytesN::from_array(&env, &salt_bytes);
+
+        // Compute salted commitment: SHA-256(salt || answer)
+        let mut preimage = Bytes::new(&env);
+        preimage.append(&Bytes::from_array(&env, &salt_bytes));
+        preimage.append(&Bytes::from_slice(&env, secret_word));
+        let salted_commitment: BytesN<32> = env.crypto().sha256(&preimage).into();
+
+        client.create_daily_puzzle(&102u64, &salted_commitment);
+        let puzzle = client.get_puzzle(&102u64).unwrap();
+
+        // Adversary attempts standard dictionary enumeration without knowing the salt
+        let dictionary: [&[u8; 5]; 5] = [b"APPLE", b"BRAVE", b"CRANE", b"DANCE", b"EAGLE"];
+        let mut recovered_word: Option<&[u8; 5]> = None;
+        for candidate in dictionary.iter() {
+            let candidate_hash = sha256_of(&env, *candidate);
+            if candidate_hash == puzzle.answer_commitment {
+                recovered_word = Some(*candidate);
+                break;
+            }
+        }
+
+        // Dictionary enumeration completely fails against the salted commitment
+        assert!(recovered_word.is_none());
+    }
+
+    #[test]
+    fn test_reveal_answer_salted_verifies_commitment() {
+        let env = Env::default();
+        let (client, _, _, _) = setup(&env);
+        env.mock_all_auths();
+
+        let answer = bytes5(&env, b"SHARK");
+        let salt_bytes: [u8; 32] = [0x7E; 32];
+        let salt = BytesN::from_array(&env, &salt_bytes);
+
+        // Compute salted commitment
+        let mut preimage = Bytes::new(&env);
+        preimage.append(&Bytes::from_array(&env, &salt_bytes));
+        preimage.append(&answer);
+        let commitment: BytesN<32> = env.crypto().sha256(&preimage).into();
+
+        client.create_daily_puzzle(&103u64, &commitment);
+
+        // Wrong salt rejected with CommitmentMismatch
+        let wrong_salt = BytesN::from_array(&env, &[0x11; 32]);
+        let err = client.try_reveal_answer_salted(&103u64, &answer, &wrong_salt);
+        assert_eq!(err, Err(Ok(Error::CommitmentMismatch)));
+
+        // Wrong word rejected with CommitmentMismatch
+        let wrong_word = bytes5(&env, b"WHALE");
+        let err = client.try_reveal_answer_salted(&103u64, &wrong_word, &salt);
+        assert_eq!(err, Err(Ok(Error::CommitmentMismatch)));
+
+        // Correct reveal succeeds
+        client.reveal_answer_salted(&103u64, &answer, &salt);
+        let puzzle = client.get_puzzle(&103u64).unwrap();
+        assert_eq!(puzzle.status, PuzzleStatus::Revealed);
+        assert_eq!(puzzle.answer, answer);
     }
 }

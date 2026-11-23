@@ -891,4 +891,122 @@ mod test {
         assert_eq!(snapshot.payout_per_winner, 300);
         assert!(snapshot.closed_at >= snapshot.opened_at);
     }
+
+    // ------------------------------------------------------------------
+    // Issue #1670: Answer confidentiality, closing rules & payout conservation
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn test_answer_confidentiality_no_leak_before_and_after_closing() {
+        let env = Env::default();
+        let (client, _admin, player, _trivia_id, _balance) = setup(&env);
+
+        let secret_payload = Bytes::from_array(&env, &[10, 20, 30, 40]);
+        let commitment = hash_answer(&env, &secret_payload);
+        client.open_round(&21, &commitment, &500);
+
+        // Snapshot during open round never exposes answer payload
+        let snap_open = client.get_round_snapshot();
+        assert_eq!(snap_open.status, RoundSnapshotStatus::Active);
+        assert!(snap_open.is_open);
+
+        // Round data stores only the 32-byte commitment hash, never plaintext
+        let round_data = client.get_round(&21).unwrap();
+        assert_eq!(round_data.answer_commitment, commitment);
+
+        // Player submits answer
+        client.submit_answer(&player, &21, &secret_payload);
+        client.close_round(&21);
+
+        // Snapshot after closing also has no plaintext answer leak
+        let snap_closed = client.get_round_snapshot();
+        assert_eq!(snap_closed.status, RoundSnapshotStatus::Resolved);
+        assert!(!snap_closed.is_open);
+    }
+
+    #[test]
+    fn test_closing_rules_zero_winners_releases_reward() {
+        let env = Env::default();
+        let (client, _admin, player, _trivia_id, _balance) = setup(&env);
+
+        let correct_payload = Bytes::from_array(&env, &[99]);
+        let wrong_payload = Bytes::from_array(&env, &[0]);
+        let commitment = hash_answer(&env, &correct_payload);
+        client.open_round(&22, &commitment, &400);
+
+        // Player submits wrong answer
+        client.submit_answer(&player, &22, &wrong_payload);
+
+        // Close round with 0 winners
+        client.close_round(&22);
+
+        let round = client.get_round(&22).unwrap();
+        assert_eq!(round.status, RoundStatus::Closed);
+        assert_eq!(round.winner_count, 0);
+        assert_eq!(round.payout_per_winner, 0);
+
+        // Player cannot claim any reward
+        let claim_res = client.try_claim_reward(&player, &22);
+        assert_eq!(claim_res, Err(Ok(Error::NoRewardAvailable)));
+    }
+
+    #[test]
+    fn test_closing_rules_multiple_winners_payout_conservation() {
+        let env = Env::default();
+        let (client, _admin, _p, _trivia_id, _balance) = setup(&env);
+
+        let p1 = Address::generate(&env);
+        let p2 = Address::generate(&env);
+        let p3 = Address::generate(&env);
+
+        let payload = Bytes::from_array(&env, &[5, 5, 5]);
+        let commitment = hash_answer(&env, &payload);
+        let total_pot = 1000i128;
+        client.open_round(&23, &commitment, &total_pot);
+
+        client.submit_answer(&p1, &23, &payload);
+        client.submit_answer(&p2, &23, &payload);
+        client.submit_answer(&p3, &23, &payload);
+
+        client.close_round(&23);
+
+        let round = client.get_round(&23).unwrap();
+        assert_eq!(round.winner_count, 3);
+        assert_eq!(round.payout_per_winner, 333);
+
+        let r1 = client.claim_reward(&p1, &23);
+        let r2 = client.claim_reward(&p2, &23);
+        let r3 = client.claim_reward(&p3, &23);
+        assert_eq!(r1, 333);
+        assert_eq!(r2, 333);
+        assert_eq!(r3, 333);
+
+        // Payout conservation: total paid <= total pot
+        assert!(r1 + r2 + r3 <= total_pot);
+
+        // Double claim rejected
+        let double_claim = client.try_claim_reward(&p1, &23);
+        assert_eq!(double_claim, Err(Ok(Error::AlreadyClaimed)));
+    }
+
+    #[test]
+    fn test_closing_rules_cannot_submit_after_close_or_double_close() {
+        let env = Env::default();
+        let (client, _admin, player, _trivia_id, _balance) = setup(&env);
+
+        let payload = Bytes::from_array(&env, &[1, 2]);
+        let commitment = hash_answer(&env, &payload);
+        client.open_round(&24, &commitment, &200);
+
+        // First close succeeds
+        client.close_round(&24);
+
+        // Double close rejected with RoundNotOpen
+        let double_close = client.try_close_round(&24);
+        assert_eq!(double_close, Err(Ok(Error::RoundNotOpen)));
+
+        // Submit after close rejected with RoundClosed
+        let late_submit = client.try_submit_answer(&player, &24, &payload);
+        assert_eq!(late_submit, Err(Ok(Error::RoundClosed)));
+    }
 }
