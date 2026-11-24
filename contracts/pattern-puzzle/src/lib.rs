@@ -1125,4 +1125,98 @@ mod test {
         // Verify the claim did not go through (has_claimed remains false due to rollback)
         assert!(!client.has_claimed(&round_id, &winner));
     }
+
+    // ------------------------------------------------------------------
+    // Issue #1669: Two live rounds sharing reward source & pot isolation
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn test_two_live_rounds_interleaved_claims_cannot_cross_consume() {
+        let env = Env::default();
+        let (client, admin, _, balance, sac) = setup(&env);
+        env.mock_all_auths();
+
+        let pattern1 = b"ROUND1_SECRET";
+        let commitment1 = sha256_of(&env, pattern1);
+        let round1_id: u32 = 10;
+        let fee1: i128 = 100;
+        client.create_puzzle(&admin, &round1_id, &commitment1, &fee1);
+
+        let pattern2 = b"ROUND2_SECRET";
+        let commitment2 = sha256_of(&env, pattern2);
+        let round2_id: u32 = 20;
+        let fee2: i128 = 50;
+        client.create_puzzle(&admin, &round2_id, &commitment2, &fee2);
+
+        // Players for Round 1
+        let p1_winner = Address::generate(&env);
+        let p1_loser = Address::generate(&env);
+        sac.mint(&p1_winner, &fee1);
+        sac.mint(&p1_loser, &fee1);
+        client.submit_solution(&p1_winner, &round1_id, &Bytes::from_slice(&env, pattern1));
+        client.submit_solution(
+            &p1_loser,
+            &round1_id,
+            &Bytes::from_slice(&env, b"WRONG_GUESS1"),
+        );
+
+        // Players for Round 2
+        let p2_winner_a = Address::generate(&env);
+        let p2_winner_b = Address::generate(&env);
+        sac.mint(&p2_winner_a, &fee2);
+        sac.mint(&p2_winner_b, &fee2);
+        client.submit_solution(&p2_winner_a, &round2_id, &Bytes::from_slice(&env, pattern2));
+        client.submit_solution(&p2_winner_b, &round2_id, &Bytes::from_slice(&env, pattern2));
+
+        // Shared contract balance contains 2*100 + 2*50 = 300 tokens
+        let tc = TokenClient::new(&env, &balance);
+        assert_eq!(tc.balance(&client.address), 300);
+
+        // Resolve both rounds independently
+        client.resolve_round(&admin, &round1_id, &Bytes::from_slice(&env, pattern1));
+        client.resolve_round(&admin, &round2_id, &Bytes::from_slice(&env, pattern2));
+
+        let r1 = client.get_round(&round1_id).unwrap();
+        assert_eq!(r1.winner_count, 1);
+        assert_eq!(r1.total_pot, 200);
+
+        let r2 = client.get_round(&round2_id).unwrap();
+        assert_eq!(r2.winner_count, 2);
+        assert_eq!(r2.total_pot, 100);
+
+        // Interleaved claims: Round 2 winner A claims first
+        let claim_r2_a = client.claim_reward(&p2_winner_a, &round2_id);
+        assert_eq!(claim_r2_a, 50); // 100 / 2
+        assert_eq!(tc.balance(&p2_winner_a), 50);
+
+        // Round 1 winner claims full Round 1 pot (200), cannot consume Round 2 funds
+        let claim_r1 = client.claim_reward(&p1_winner, &round1_id);
+        assert_eq!(claim_r1, 200);
+        assert_eq!(tc.balance(&p1_winner), 200);
+
+        // Contract balance should have exactly 50 remaining for Round 2 winner B
+        assert_eq!(tc.balance(&client.address), 50);
+
+        // Simulate partial fund depletion (drain 10 tokens) before Round 2 winner B claims
+        let sink = Address::generate(&env);
+        tc.transfer(&client.address, &sink, &10);
+        assert_eq!(tc.balance(&client.address), 40);
+
+        // Winner B attempt fails cleanly because contract balance (40) < reward (50)
+        let fail_claim = client.try_claim_reward(&p2_winner_b, &round2_id);
+        assert_eq!(fail_claim, Err(Ok(Error::InsufficientFunds)));
+        assert!(!client.has_claimed(&round2_id, &p2_winner_b));
+
+        // Replenish the 10 tokens
+        sac.mint(&client.address, &10);
+        assert_eq!(tc.balance(&client.address), 50);
+
+        // Winner B now successfully claims their exact entitlement (50)
+        let claim_r2_b = client.claim_reward(&p2_winner_b, &round2_id);
+        assert_eq!(claim_r2_b, 50);
+        assert_eq!(tc.balance(&p2_winner_b), 50);
+
+        // Contract pot is now completely and cleanly exhausted with 0 residue
+        assert_eq!(tc.balance(&client.address), 0);
+    }
 }
