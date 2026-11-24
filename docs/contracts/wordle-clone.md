@@ -82,6 +82,26 @@ pub fn reveal_answer(env: Env, puzzle_id: u64, answer: Bytes) -> Result<(), Erro
 
 `Result<(), Error>`
 
+### `reveal_answer_salted`
+Reveal the plaintext answer for an open puzzle using a cryptographic salt. Admin only.  Computes `SHA-256(salt || answer)` and verifies against `answer_commitment`. Transitions the puzzle to `Revealed` state; prevents dictionary pre-computation attacks (#1672). Must be called before `finalize_result`.
+
+```rust
+pub fn reveal_answer_salted(env: Env, puzzle_id: u64, answer: Bytes, salt: BytesN<32>) -> Result<(), Error>
+```
+
+#### Parameters
+
+| Name | Type |
+|------|------|
+| `env` | `Env` |
+| `puzzle_id` | `u64` |
+| `answer` | `Bytes` |
+| `salt` | `BytesN<32>` |
+
+#### Return Type
+
+`Result<(), Error>`
+
 ### `finalize_result`
 Score all player attempts and record winners. Admin only.  The `player` parameter is included per the issue interface; the contract scores ALL players in a single pass for consistency, then transitions the puzzle to `Finalized`. Must be called after `reveal_answer`.  Iterates all submissions (bounded by `MAX_PLAYERS_PER_PUZZLE × MAX_ATTEMPTS`). A player is a winner if any of their attempts matches the answer exactly.  Emits `PuzzleFinalized`.
 
