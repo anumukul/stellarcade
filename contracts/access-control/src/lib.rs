@@ -10,14 +10,14 @@ pub enum DataKey {
     RoleMembers(Symbol),
 }
 
-// Predefined roles as constants for reuse
+
 use soroban_sdk::symbol_short;
 pub const ADMIN: Symbol = symbol_short!("ADMIN");
 pub const OPERATOR: Symbol = symbol_short!("OPERATOR");
 pub const PAUSER: Symbol = symbol_short!("PAUSER");
 pub const GAME: Symbol = symbol_short!("GAME");
 
-// ── Events ────────────────────────────────────────────────────────
+
 #[contractevent]
 pub struct RoleGranted {
     pub role: Symbol,
@@ -35,19 +35,18 @@ pub struct AccessControl;
 
 #[contractimpl]
 impl AccessControl {
-    /// Initializes the contract with a super admin.
-    /// This admin will have the power to grant and revoke any roles.
+    
     pub fn init(env: Env, admin: Address) {
         if env.storage().instance().has(&DataKey::Admin) {
             panic!("Already initialized");
         }
         env.storage().instance().set(&DataKey::Admin, &admin);
 
-        // The admin also gets the ADMIN role by default for internal consistency
+        
         internal_grant_role(&env, ADMIN, admin);
     }
 
-    /// Grants a role to an account. Only accounts with ADMIN role (or the super admin) can call this.
+    
     pub fn grant_role(env: Env, role: Symbol, account: Address) {
         require_admin(&env);
         internal_grant_role(&env, role, account);
