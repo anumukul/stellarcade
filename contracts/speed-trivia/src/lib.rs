@@ -279,10 +279,9 @@ impl SpeedTrivia {
             return Err(Error::PastDeadline);
         }
 
-        // Validate timestamp: shouldn't be too far in the future or drastically in the past
-        // For simplicity, we ensure it's not beyond current ledger time.
-        if timestamp > now {
-            return Err(Error::InvalidAmount); // Or a more specific error
+        // Validate timestamp: ensure it is within the active round window (opened_at..=now)
+        if timestamp > now || timestamp < round.opened_at {
+            return Err(Error::InvalidAmount);
         }
 
         let submission_key = DataKey::Submission(round_id, player.clone());
@@ -903,5 +902,106 @@ mod test {
         let s0 = e0.player.to_string();
         let s1 = e1.player.to_string();
         assert!(s0 <= s1);
+    }
+
+    // ------------------------------------------------------------------
+    // Issue #1671: Trustworthy answer ordering, tie rules & payout conservation
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn test_invalid_timestamps_rejected() {
+        let env = Env::default();
+        env.ledger().set_timestamp(1_000);
+        let (client, _admin, player, _trivia_id, _balance) = setup(&env);
+
+        let opened_at = env.ledger().timestamp();
+        let deadline = opened_at + 500;
+        let payload = Bytes::from_array(&env, &[42]);
+        let commitment = hash_answer(&env, &payload);
+        client.open_question(&11, &commitment, &deadline, &500);
+
+        // Advance ledger by 100 seconds
+        env.ledger().set_timestamp(opened_at + 100);
+        let now = env.ledger().timestamp();
+
+        // Timestamp before opened_at is rejected
+        let res_past = client.try_submit_answer(&player, &11, &payload, &(opened_at - 1));
+        assert_eq!(res_past, Err(Ok(Error::InvalidAmount)));
+
+        // Timestamp in the future (> now) is rejected
+        let res_future = client.try_submit_answer(&player, &11, &payload, &(now + 10));
+        assert_eq!(res_future, Err(Ok(Error::InvalidAmount)));
+
+        // Valid timestamp within [opened_at, now] succeeds
+        let res_valid = client.submit_answer(&player, &11, &payload, &now);
+        assert_eq!(res_valid, ());
+    }
+
+    #[test]
+    fn test_late_and_duplicate_answers_rejected() {
+        let env = Env::default();
+        let (client, _admin, player, _trivia_id, _balance) = setup(&env);
+
+        let opened_at = env.ledger().timestamp();
+        let deadline = opened_at + 200;
+        let payload = Bytes::from_array(&env, &[1, 2, 3]);
+        let commitment = hash_answer(&env, &payload);
+        client.open_question(&12, &commitment, &deadline, &300);
+
+        // Submit once successfully
+        client.submit_answer(&player, &12, &payload, &opened_at);
+
+        // Duplicate submission from same player is rejected
+        let dup = client.try_submit_answer(&player, &12, &payload, &opened_at);
+        assert_eq!(dup, Err(Ok(Error::AlreadySubmitted)));
+
+        // Advance ledger past deadline
+        let other_player = Address::generate(&env);
+        env.ledger().set_timestamp(deadline + 1);
+        let late = client.try_submit_answer(&other_player, &12, &payload, &(deadline + 1));
+        assert_eq!(late, Err(Ok(Error::PastDeadline)));
+    }
+
+    #[test]
+    fn test_deterministic_payout_conservation_with_tied_winners() {
+        let env = Env::default();
+        let (client, _admin, _p, _trivia_id, _balance) = setup(&env);
+
+        let p1 = Address::generate(&env);
+        let p2 = Address::generate(&env);
+        let p3 = Address::generate(&env);
+
+        let deadline = env.ledger().timestamp() + 1000;
+        let payload = Bytes::from_array(&env, &[77]);
+        let commitment = hash_answer(&env, &payload);
+        let total_reward = 1000i128;
+        client.open_question(&13, &commitment, &deadline, &total_reward);
+
+        let ts = env.ledger().timestamp();
+        client.submit_answer(&p1, &13, &payload, &ts);
+        client.submit_answer(&p2, &13, &payload, &ts);
+        client.submit_answer(&p3, &13, &payload, &ts);
+
+        // Finalize round: 3 winners sharing 1000 -> payout per winner = 333
+        client.finalize_round(&13);
+
+        let round = client.get_round(&13).unwrap();
+        assert_eq!(round.winner_count, 3);
+        assert_eq!(round.payout_per_winner, 333);
+
+        // Claim rewards
+        let r1 = client.claim_reward(&p1, &13);
+        let r2 = client.claim_reward(&p2, &13);
+        let r3 = client.claim_reward(&p3, &13);
+        assert_eq!(r1, 333);
+        assert_eq!(r2, 333);
+        assert_eq!(r3, 333);
+
+        // Total disbursed = 999 <= 1000 (conservation invariant holds)
+        assert!(r1 + r2 + r3 <= total_reward);
+
+        // Double claim is rejected
+        let double_claim = client.try_claim_reward(&p1, &13);
+        assert_eq!(double_claim, Err(Ok(Error::AlreadyClaimed)));
     }
 }
